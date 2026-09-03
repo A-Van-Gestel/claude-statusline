@@ -1,0 +1,3 @@
+# The script is edited and installed on both Linux and Windows; pin LF so a
+# commit from either side cannot flip the whole file to CRLF
+* text=auto eol=lf

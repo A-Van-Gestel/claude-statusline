@@ -1,0 +1,6 @@
+# Windows NTFS alternate-data-stream markers, which surface as real files
+# when the tree is copied to a non-NTFS filesystem
+*:Zone.Identifier
+Thumbs.db
+desktop.ini
+.DS_Store
