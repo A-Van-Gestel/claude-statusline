@@ -35,6 +35,11 @@ status line is otherwise only redrawn on events, so without it a countdown
 freezes at whatever it read when you last typed. It is read at startup, so
 changing it needs a restart; the script itself is re-read every render.
 
+**Optional QOL:** set `refreshInterval` to `10`. At 30 the seconds-only
+countdowns (the last ten minutes of any timer) step in 30-second jumps while
+idle; at 10 the final minute reads close to true. The cost is one ~40 ms `node`
+run per tick in each open session; the state file is only rewritten on change.
+
 ## What each field means
 
 | Field | Source | Notes |
