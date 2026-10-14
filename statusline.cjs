@@ -13,7 +13,14 @@ const BAR_WIDTH = 10;
 const FILLED = '█';
 const EMPTY = '░';
 const CACHE_KEEP = 24 * 3600;
+// The keepalive flag allows touches up to 120s apart; a touch older than this
+// means the server has stopped renewing the cache.
+const TOUCH_FRESH = 150;
+const KEEPALIVE_WINDOW_DEFAULT = 60;
 const CONFIG_DIR = process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude');
+const GLOBAL_CONFIG = process.env.CLAUDE_CONFIG_DIR
+  ? path.join(process.env.CLAUDE_CONFIG_DIR, '.claude.json')
+  : path.join(os.homedir(), '.claude.json');
 // State lives beside the config rather than in a world-writable tmpdir: the
 // paths are predictable, and only the owner's directory may hold them.
 const STATE_FILE = path.join(CONFIG_DIR, '.statusline-state.json');
@@ -135,6 +142,21 @@ function keepCache(entry, now) {
 }
 
 /**
+ * A server keepalive touch moves expires_at without a new request, so a later
+ * expiry at an unchanged request count is a touch. A changed count is activity,
+ * which restarts the keepalive window.
+ */
+function trackActivity(entry, live, prior, now) {
+  const requests = typeof live.requests === 'number' ? live.requests : null;
+  const sameRun = !!prior && prior.requests === requests;
+  entry.requests = requests;
+  entry.active_at = sameRun && typeof prior.active_at === 'number' ? prior.active_at : now;
+  if (sameRun && live.warm !== false && entry.expires_at > prior.expires_at) entry.touch_seen_at = now;
+  else if (prior && typeof prior.touch_seen_at === 'number') entry.touch_seen_at = prior.touch_seen_at;
+  return entry;
+}
+
+/**
  * A resumed session runs in a fresh process whose in-memory prompt-cache
  * tracker is empty, so the payload carries no reading until its first response
  * even while the cache is still warm. The last expiry bridges that gap; a live
@@ -143,34 +165,63 @@ function keepCache(entry, now) {
  */
 function resolveCache(live, ownEntry) {
   const now = Date.now() / 1000;
+  const prior = keepCache(ownEntry, now) ? ownEntry : null;
   if (live && live.caching_observed) {
     // The CLI dates an absent ttl on the 5m scale, so anything but an explicit
     // 1h must follow it or the colour ramp is out by a factor of twelve.
     const ttl = live.ttl === '1h' ? 3600 : 300;
-    if (live.warm === false) {
-      const entry = { expires_at: now, ttl };
-      return { display: entry, own: entry };
-    }
-    if (typeof live.expires_at === 'number') {
-      const entry = { expires_at: live.expires_at, ttl };
+    let entry = null;
+    if (live.warm === false) entry = { expires_at: now, ttl };
+    else if (typeof live.expires_at === 'number') entry = { expires_at: live.expires_at, ttl };
+    if (entry) {
+      trackActivity(entry, live, prior, now);
       return { display: entry, own: entry };
     }
   }
-  const own = keepCache(ownEntry, now) ? ownEntry : null;
-  return { display: own, own };
+  return { display: prior, own: prior };
 }
 
 /**
- * Grey while there is room, yellow inside the last quarter of the TTL, red
- * inside the last twelfth, then red COLD. Absent until a turn has been cached.
+ * The server's keepalive window in seconds, from the CLI's cached feature
+ * flags. The file must be a regular file of sane size, as for the caveman flag.
  */
-function cacheTrailer(state) {
+function keepaliveWindow() {
+  try {
+    const stat = fs.lstatSync(GLOBAL_CONFIG);
+    if (stat.isFile() && stat.size <= 16 * 1024 * 1024) {
+      const config = JSON.parse(fs.readFileSync(GLOBAL_CONFIG, 'utf8'));
+      const flag = config && config.cachedGrowthBookFeatures
+        && config.cachedGrowthBookFeatures.tengu_sequential_cloud;
+      const minutes = flag && flag.activityWindowMinutes;
+      if (typeof minutes === 'number' && minutes >= 1 && minutes <= 1440) return minutes * 60;
+    }
+  } catch {
+    /* an unreadable config falls back to the CLI's own default */
+  }
+  return KEEPALIVE_WINDOW_DEFAULT * 60;
+}
+
+/**
+ * While keepalive touches arrive, the cache lives until the activity window
+ * lapses plus one TTL; a trailing ↻ marks that mode. Grey while there is room,
+ * yellow inside the last quarter, red inside the last twelfth, then red COLD.
+ */
+function cacheTrailer(state, window) {
   if (!state) return '';
   const label = ` ${DIM}· cache${RESET} `;
-  const remaining = state.expires_at - Date.now() / 1000;
-  if (remaining <= 0) return `${label}${RED}   COLD${RESET}`;
-  const colour = remaining <= state.ttl / 12 ? RED : remaining <= state.ttl / 4 ? YELLOW : DIM;
-  return `${label}${colour}${countdown(state.expires_at).padStart(7, ' ')}${RESET}`;
+  const now = Date.now() / 1000;
+  if (state.expires_at - now <= 0) return `${label}${RED}   COLD${RESET}`;
+  const keepalive = typeof state.touch_seen_at === 'number' && now - state.touch_seen_at <= TOUCH_FRESH;
+  // Typing extends the window without a request, so a passed estimate while
+  // touches still arrive falls back to the live expiry rather than guessing.
+  const estimating = keepalive && typeof state.active_at === 'number' && now < state.active_at + window;
+  const target = estimating ? Math.max(state.expires_at, state.active_at + window + state.ttl) : state.expires_at;
+  const span = estimating ? window + state.ttl : state.ttl;
+  const remaining = target - now;
+  const colour = remaining <= span / 12 ? RED : remaining <= span / 4 ? YELLOW : DIM;
+  const symbols = [keepalive && `${colour}↻${RESET}`].filter(Boolean);
+  const suffix = symbols.length ? ` ${symbols.join(' ')}` : '';
+  return `${label}${colour}${countdown(target).padStart(7, ' ')}${RESET}${suffix}`;
 }
 
 /**
@@ -234,7 +285,7 @@ function render(data) {
   const limits = limitState.display;
   const context = data.context_window || {};
   const used = typeof context.used_percentage === 'number' ? context.used_percentage : null;
-  segments.push(bar('ctx', used, cacheTrailer(cacheState.display)));
+  segments.push(bar('ctx', used, cacheTrailer(cacheState.display, keepaliveWindow())));
   segments.push(bar('5h', limits.five_hour.used_percentage, resetTrailer(limits.five_hour.resets_at)));
   segments.push(bar('7d', limits.seven_day.used_percentage, resetTrailer(limits.seven_day.resets_at)));
 

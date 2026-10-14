@@ -41,7 +41,7 @@ changing it needs a restart; the script itself is re-read every render.
 |---|---|---|
 | model + effort | `model.display_name`, `effort.level` | effort omitted on models without it |
 | `ctx` | `context_window.used_percentage` | `--%` before the first turn |
-| `cache` | `prompt_cache.expires_at` / `.ttl` | absent until a turn is cached |
+| `cache` | `prompt_cache.expires_at` / `.ttl` / `.requests` | absent until a turn is cached; trailing `↻` while the server keeps it warm |
 | `5h` / `7d` | `rate_limits.five_hour` / `.seven_day` | subscription windows |
 
 Colours: green under 70%, yellow 70–89%, red 90%+. The cache countdown is grey
@@ -51,7 +51,8 @@ then red `COLD`.
 Countdowns gain precision as they shrink — `2d 13h` → `4h 45m` → `9m 30s` —
 so the final minutes of a 5-minute cache tier stay readable. Every form is
 seven columns wide, and every percentage four, so nothing reflows as values
-change.
+change. Status symbols such as `↻` trail the cache countdown and take space
+only while they are on, so the line shifts once when one appears.
 
 ## Deliberate behaviours
 
@@ -69,6 +70,17 @@ in memory, so a resumed session reports nothing until its first response even
 though the cache is still warm. The last expiry is stored per session to bridge
 that gap; a live reading always wins, and entries are dropped a day past expiry.
 
+**The cache countdown follows the server keepalive.** On accounts where Claude
+Code runs its cache keepalive, the main session uses the 5-minute tier and the
+CLI renews it every ~30 s for as long as there was activity in the last hour
+(`activityWindowMinutes`, read from the CLI's cached feature flags in
+`~/.claude.json`, default 60). A renewal moves `expires_at` without a new
+request, which is how the script spots one. While renewals arrive, the segment
+counts down to when the cache will really go cold — last request + window +
+TTL — followed by `↻` (`cache  1h 04m ↻`). Without renewals for 150 s the `↻`
+drops and the plain expiry shows again, so failed or stopped touches still end
+in `COLD`.
+
 **Overages tell the truth.** Past 100% the gauge saturates but the number does
 not, so `105%` reads as `105%`.
 
@@ -85,17 +97,35 @@ renders, so the script is safe to use as-is on instances that don't have it.
 Delete `cavemanBadge` and its call in `render` if you would rather not carry
 the code at all.
 
+## Tests
+
+```
+node --test test/*.test.cjs
+```
+
+Each test renders the script in a child process against a throwaway config dir,
+with `Date.now` pinned by `test/fake-clock.cjs`. No dependencies.
+
 ## A caveat worth knowing
 
 `prompt_cache` is **not** in Claude Code's documented status-line schema. It is
 real — verified in the CLI binary and in live payloads on 2.1.259 — but being
 undocumented it may change or disappear without notice. If it does, the cache
-segment simply stops rendering; nothing else is affected.
+segment simply stops rendering; nothing else is affected. The keepalive flag
+(`tengu_sequential_cloud`) is internal too; if it goes, the window falls back to
+60 minutes.
+
+The keepalive countdown is an estimate in two places: typing without sending
+also extends the server's window but is invisible here (the segment then falls
+back to the live expiry), and a resumed session's touches do not reach the
+payload, so its bridged countdown can read `COLD` while the server still keeps
+the cache warm.
 
 Field names for everything else come from the documented schema and are stable.
 
 ## Verified against
 
-Claude Code 2.1.259, Node 24, Linux. The payload contract (`prompt_cache`,
+Claude Code 2.1.259, Node 24, Linux; the keepalive countdown against 2.1.299,
+Node 26, Windows. The payload contract (`prompt_cache`,
 `rate_limits`, `context_window`, `effort`) was checked against the CLI binary
 rather than assumed.
