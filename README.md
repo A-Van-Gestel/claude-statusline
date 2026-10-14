@@ -40,6 +40,27 @@ countdowns (the last ten minutes of any timer) step in 30-second jumps while
 idle; at 10 the final minute reads close to true. The cost is one ~40 ms `node`
 run per tick in each open session; the state file is only rewritten on change.
 
+**WSL and Windows on one account:** each has its own config directory, so each
+keeps its own state file and an idle session on one side never sees the
+other's readings. To share one, point the WSL side at the Windows file with
+`STATUSLINE_STATE_FILE` (an absolute path; anything else is ignored) in the
+WSL `settings.json`:
+
+```json
+{
+  "env": { "STATUSLINE_STATE_FILE": "/mnt/c/Users/<you>/.claude/.statusline-state.json" }
+}
+```
+
+Sessions on different accounts can share the file safely: each reads and
+writes only its own account's slot. The account is read from `.claude.json`,
+not from the running session, so after a `/login` to another account, the
+sessions already open on that side count toward the new account until they
+restart. Both sides must run the same script
+version. Through `/mnt/c` a WSL render
+takes ~20 ms longer, and mode `0600` is not enforced there — the Windows
+profile's own permissions apply instead.
+
 ## What each field means
 
 | Field | Source | Notes |
@@ -65,10 +86,18 @@ only while they are on, so the line shifts once when one appears.
 reset* reads `0%`, because a reset window genuinely starts empty. Same for
 `ctx`: `--%` before the first turn, `0%` for a turn too small to register.
 
-**Rate limits persist across sessions.** They are account-wide, and the payload
-only carries them just after an API response, so the last reading is cached in
-`~/.claude/.statusline-state.json` (mode `0600`). A new session inherits it
-instead of starting blank. Placeholders are never persisted.
+**Rate limits are shared across sessions.** They are account-wide, but each
+session's payload repeats whatever its own process last heard from the API, so
+an idle session's reading falls behind. The newest reading any session has seen
+is kept in `~/.claude/.statusline-state.json` (mode `0600`), one slot per
+logged-in account (`oauthAccount.accountUuid` in `.claude.json`, else
+`default`): a later window wins, and within one window the higher usage, since
+usage only rises until the reset. A slot whose windows have all reset is
+dropped. An idle session therefore follows the active one within one
+`refreshInterval`, and a new session inherits the reading instead of starting
+blank. Placeholders are never persisted. When every session is idle, usage
+from elsewhere (claude.ai, another machine) shows up only after the next
+response.
 
 **The cache countdown survives a resume.** The CLI's prompt-cache tracker lives
 in memory, so a resumed session reports nothing until its first response even
@@ -91,7 +120,9 @@ not, so `105%` reads as `105%`.
 
 Writes go to a temp file opened `wx` and are renamed into place, and each write
 merges other sessions' entries from a read taken at write time — several
-sessions share this one file and all of them write to it on the same timer.
+sessions share this one file and all of them write to it on the same timer. A
+file that exists but cannot be read, as during another process's rename, is
+left alone for that frame rather than overwritten; a corrupt one is replaced.
 
 ## Optional integrations
 
@@ -131,6 +162,6 @@ Field names for everything else come from the documented schema and are stable.
 ## Verified against
 
 Claude Code 2.1.259, Node 24, Linux; the keepalive countdown against 2.1.299,
-Node 26, Windows. The payload contract (`prompt_cache`,
-`rate_limits`, `context_window`, `effort`) was checked against the CLI binary
-rather than assumed.
+Node 26, Windows; rate-limit sharing against 2.1.299 on Windows and WSL. The
+payload contract (`prompt_cache`, `rate_limits`, `context_window`, `effort`)
+was checked against the CLI binary rather than assumed.

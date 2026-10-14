@@ -22,8 +22,11 @@ const GLOBAL_CONFIG = process.env.CLAUDE_CONFIG_DIR
   ? path.join(process.env.CLAUDE_CONFIG_DIR, '.claude.json')
   : path.join(os.homedir(), '.claude.json');
 // State lives beside the config rather than in a world-writable tmpdir: the
-// paths are predictable, and only the owner's directory may hold them.
-const STATE_FILE = path.join(CONFIG_DIR, '.statusline-state.json');
+// paths are predictable, and only the owner's directory may hold them. An
+// absolute override lets WSL and Windows share one file.
+const STATE_FILE = process.env.STATUSLINE_STATE_FILE && path.isAbsolute(process.env.STATUSLINE_STATE_FILE)
+  ? process.env.STATUSLINE_STATE_FILE
+  : path.join(CONFIG_DIR, '.statusline-state.json');
 
 const DIM = '\x1b[2m';
 const RESET = '\x1b[0m';
@@ -75,9 +78,19 @@ function resetTrailer(resetsAt) {
   return ` ${DIM}· ${left.padStart(7, ' ')}${RESET}`;
 }
 
+/**
+ * Null when the file exists but cannot be read, as during another process's
+ * rename; an absent or corrupt file is empty state, so it heals on next write.
+ */
 function readState() {
+  let raw;
   try {
-    const state = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
+    raw = fs.readFileSync(STATE_FILE, 'utf8');
+  } catch (error) {
+    return error && error.code === 'ENOENT' ? {} : null;
+  }
+  try {
+    const state = JSON.parse(raw);
     return state && typeof state === 'object' ? state : {};
   } catch {
     return {};
@@ -107,22 +120,27 @@ function usable(window) {
 }
 
 /**
- * Rate limits vanish from the payload between API responses, which would make
- * the bars flicker, so the last usable reading is kept until it is replaced.
- * A window past its reset is genuinely back to zero and says so; one never
- * measured is unknown, and says that instead of claiming an idle account.
- * Only real readings are persisted — never a placeholder, which would leak
- * into the next session as if it had been measured.
+ * The later window wins, and within one window the higher usage, which only
+ * rises until the reset; an idle session's stale reading loses either way.
+ */
+function newer(live, cached) {
+  if (!usable(live)) return cached;
+  if (!usable(cached)) return live;
+  if (live.resets_at !== cached.resets_at) return live.resets_at > cached.resets_at ? live : cached;
+  return live.used_percentage >= cached.used_percentage ? live : cached;
+}
+
+/**
+ * The payload repeats this process's last reading; the state file holds the
+ * newest any session has seen. A window past its reset reads zero, one never
+ * measured reads unknown, and only real readings are persisted.
  */
 function resolveLimits(live, cached) {
   const now = Date.now() / 1000;
   const display = {};
   const persist = {};
   for (const key of ['five_hour', 'seven_day']) {
-    // Presence is not usability: a partial live window must not shadow a good
-    // cached one, or the reading would be lost rather than merely stale.
-    const liveWindow = live && live[key];
-    const window = usable(liveWindow) ? liveWindow : cached[key];
+    const window = newer(live && live[key], cached[key]);
     if (!usable(window)) {
       display[key] = { used_percentage: null };
       continue;
@@ -181,24 +199,37 @@ function resolveCache(live, ownEntry) {
   return { display: prior, own: prior };
 }
 
-/**
- * The server's keepalive window in seconds, from the CLI's cached feature
- * flags. The file must be a regular file of sane size, as for the caveman flag.
- */
-function keepaliveWindow() {
+/** The CLI's global config, or {}; it must be a regular file of sane size, as for the caveman flag. */
+function readGlobalConfig() {
   try {
     const stat = fs.lstatSync(GLOBAL_CONFIG);
     if (stat.isFile() && stat.size <= 16 * 1024 * 1024) {
       const config = JSON.parse(fs.readFileSync(GLOBAL_CONFIG, 'utf8'));
-      const flag = config && config.cachedGrowthBookFeatures
-        && config.cachedGrowthBookFeatures.tengu_sequential_cloud;
-      const minutes = flag && flag.activityWindowMinutes;
-      if (typeof minutes === 'number' && minutes >= 1 && minutes <= 1440) return minutes * 60;
+      if (config && typeof config === 'object') return config;
     }
   } catch {
-    /* an unreadable config falls back to the CLI's own default */
+    /* an unreadable config falls back to the defaults */
   }
+  return {};
+}
+
+/** The server's keepalive window in seconds, from the CLI's cached feature flags. */
+function keepaliveWindow(config) {
+  const flag = config.cachedGrowthBookFeatures && config.cachedGrowthBookFeatures.tengu_sequential_cloud;
+  const minutes = flag && flag.activityWindowMinutes;
+  if (typeof minutes === 'number' && minutes >= 1 && minutes <= 1440) return minutes * 60;
   return KEEPALIVE_WINDOW_DEFAULT * 60;
+}
+
+/** Rate limits are per account, so each logged-in account keeps its own slot in the shared file. */
+function accountKey(config) {
+  const uuid = config.oauthAccount && config.oauthAccount.accountUuid;
+  return typeof uuid === 'string' && /^[A-Za-z0-9-]{1,64}$/.test(uuid) ? uuid : 'default';
+}
+
+/** A slot is worth keeping while any of its windows has yet to reset. */
+function liveSlot(slot, now) {
+  return !!slot && ['five_hour', 'seven_day'].some((key) => usable(slot[key]) && slot[key].resets_at > now);
 }
 
 /**
@@ -252,17 +283,24 @@ function cavemanBadge() {
  * a concurrent session's freshly written expiry is dropped, and a resumed one
  * would not rewrite it until its next turn.
  */
-function commit(sessionId, limits, ownCache) {
+function commit(sessionId, account, limits, ownCache) {
   const now = Date.now() / 1000;
   const current = readState();
+  // Writing over a file we could not read would drop every other session.
+  if (!current) return;
   const cache = {};
   for (const [id, entry] of Object.entries(current.cache || {})) {
     if (id !== sessionId && keepCache(entry, now)) cache[id] = entry;
   }
   if (ownCache) cache[sessionId] = ownCache;
+  const accounts = {};
+  for (const [id, slot] of Object.entries(current.accounts || {})) {
+    if (id !== account && liveSlot(slot, now)) accounts[id] = slot;
+  }
+  if (Object.keys(limits).length) accounts[account] = limits;
 
-  const state = { limits, cache };
-  const before = { limits: current.limits || {}, cache: current.cache || {} };
+  const state = { accounts, cache };
+  const before = { accounts: current.accounts || {}, cache: current.cache || {} };
   if (JSON.stringify(state) !== JSON.stringify(before)) writeState(state);
 }
 
@@ -275,17 +313,19 @@ function render(data) {
 
   // Windows are account-wide, so a new session inherits the last known reading
   // instead of starting blind; the cache expiry belongs to one session.
-  const previous = readState();
+  const previous = readState() || {};
+  const config = readGlobalConfig();
+  const account = accountKey(config);
   const sessionId = String(data.session_id || 'default').replace(/[^A-Za-z0-9_-]/g, '') || 'default';
-  const limitState = resolveLimits(data.rate_limits, previous.limits || {});
+  const limitState = resolveLimits(data.rate_limits, (previous.accounts || {})[account] || {});
   const cacheState = resolveCache(data.prompt_cache, (previous.cache || {})[sessionId]);
-  commit(sessionId, limitState.persist, cacheState.own);
+  commit(sessionId, account, limitState.persist, cacheState.own);
 
   // An unmeasured context is distinct from one a one-line turn rounds to zero.
   const limits = limitState.display;
   const context = data.context_window || {};
   const used = typeof context.used_percentage === 'number' ? context.used_percentage : null;
-  segments.push(bar('ctx', used, cacheTrailer(cacheState.display, keepaliveWindow())));
+  segments.push(bar('ctx', used, cacheTrailer(cacheState.display, keepaliveWindow(config))));
   segments.push(bar('5h', limits.five_hour.used_percentage, resetTrailer(limits.five_hour.resets_at)));
   segments.push(bar('7d', limits.seven_day.used_percentage, resetTrailer(limits.seven_day.resets_at)));
 
