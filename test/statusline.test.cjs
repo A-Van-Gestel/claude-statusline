@@ -21,10 +21,12 @@ let dir;
 beforeEach(() => { dir = fs.mkdtempSync(path.join(os.tmpdir(), 'statusline-test-')); });
 afterEach(() => { fs.rmSync(dir, { recursive: true, force: true }); });
 
-/** The child's env: never the caller's state-file override, which may point at a live file. */
+/** The child's env: never the caller's state-file or log override, which may point at a live file. */
 function testEnv(extra) {
   const env = { ...process.env, CLAUDE_CONFIG_DIR: dir, ...extra };
-  if (!extra || !('STATUSLINE_STATE_FILE' in extra)) delete env.STATUSLINE_STATE_FILE;
+  for (const key of ['STATUSLINE_STATE_FILE', 'STATUSLINE_DEBUG_LOG']) {
+    if (!extra || !(key in extra)) delete env[key];
+  }
   return env;
 }
 
@@ -216,6 +218,16 @@ test('a state file that cannot be read is not overwritten', () => {
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout.replace(/\x1b\[[0-9;]*m/g, ''), /5h \S+ +40%/);
   assert.equal(fs.readFileSync(file, 'utf8'), state);
+});
+
+test('a debug log gets one line per payload, and only at an absolute path', () => {
+  const log = path.join(dir, 'payloads.jsonl');
+  fiveHour('s1', 40, { env: { STATUSLINE_DEBUG_LOG: log } });
+  fiveHour('s1', 41, { env: { STATUSLINE_DEBUG_LOG: log } });
+  const lines = fs.readFileSync(log, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+  assert.deepEqual(lines.map((line) => line.payload.rate_limits.five_hour.used_percentage), [40, 41]);
+  fiveHour('s1', 42, { env: { STATUSLINE_DEBUG_LOG: 'relative.jsonl' } });
+  assert.equal(fs.existsSync(path.join(dir, 'relative.jsonl')), false);
 });
 
 test('a corrupt state file is replaced on the next write', () => {

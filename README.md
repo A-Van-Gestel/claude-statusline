@@ -142,6 +142,28 @@ node --test test/*.test.cjs
 Each test renders the script in a child process against a throwaway config dir,
 with `Date.now` pinned by `test/fake-clock.cjs`. No dependencies.
 
+`test/stress.cjs` is a manual check for the shared state file, outside the
+suite: start several at once against one file — from Windows and WSL when they
+share it — and each prints its failures and render timings.
+
+```
+node test/stress.cjs /absolute/path/to/scratch-state.json a 60
+```
+
+Point it at a scratch file, never the live one: it writes made-up readings.
+
+## Investigating
+
+Set `STATUSLINE_DEBUG_LOG` to an absolute path (in `settings.json` → `env`) and
+every render appends `{ at, payload }` as one JSON line — the exact payload the
+CLI sent. It is read at startup like any `env` setting, so restart the session;
+unset it when done, as the file grows by a line per render.
+
+To trace a payload field back to the code that builds it, search the CLI binary
+(`~/.local/share/claude/versions/<version>`) with
+`python tools/find-in-binary.py <binary> <out dir> <anchor>...` — for example
+`rate_limits:` — and read the windows it writes.
+
 ## A caveat worth knowing
 
 `prompt_cache` is **not** in Claude Code's documented status-line schema. It is

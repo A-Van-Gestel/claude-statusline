@@ -335,6 +335,17 @@ function render(data) {
   return segments.join(`  ${DIM}│${RESET}  `);
 }
 
+/** Appends the payload to an absolute STATUSLINE_DEBUG_LOG, for tracing what the CLI sends. */
+function debugLog(data) {
+  const file = process.env.STATUSLINE_DEBUG_LOG;
+  if (!file || !path.isAbsolute(file)) return;
+  try {
+    fs.appendFileSync(file, `${JSON.stringify({ at: Date.now() / 1000, payload: data })}\n`, { mode: 0o600 });
+  } catch {
+    /* a failed log line costs nothing but the line */
+  }
+}
+
 let raw = '';
 process.stdin.setEncoding('utf8');
 process.stdin.on('data', (chunk) => { raw += chunk; });
@@ -345,5 +356,6 @@ process.stdin.on('end', () => {
   } catch {
     /* render what we can from an unparseable payload */
   }
+  debugLog(data);
   process.stdout.write(render(data));
 });
